@@ -1,0 +1,1676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RockEmSockEm Ice Fury - Original 6</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a1a; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; }
+canvas { display:block; border:2px solid #222; }
+#ctrl { color:#555; font:12px monospace; margin-top:8px; text-align:center; letter-spacing:1px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="800" height="560"></canvas>
+<div id="ctrl">ARROWS/WASD: Move &nbsp;|&nbsp; SPACE: Shoot &nbsp;|&nbsp; Z: Pass &nbsp;|&nbsp; X: Bodycheck &nbsp;|&nbsp; F: Challenge &nbsp;|&nbsp; TAB: Switch Player &nbsp;|&nbsp; P: Pause</div>
+<script>
+'use strict';
+// ─────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────
+const W=800,H=560;
+const RX=70,RY=90,RW=660,RH=360;
+const RCX=RX+RW/2, RCY=RY+RH/2;
+const PR=14, PUCK_R=7;
+const GOAL_H=76, GOAL_W=12;
+const GOAL_Y=RCY-GOAL_H/2;
+const PERIOD_SEC=120, NUM_PERIODS=3, PENALTY_SEC=30;
+const PU_SPAWN=22, PU_DUR=8;
+const RINK_R=58; // rounded corner radius
+
+const TEAMS=[
+  {name:'RANGERS',     abbr:'NYR', pri:'#003087', sec:'#CE1126'},
+  {name:'BRUINS',      abbr:'BOS', pri:'#111111', sec:'#FFB81C'},
+  {name:'CANADIENS',   abbr:'MTL', pri:'#AF1E2D', sec:'#003DA5'},
+  {name:'MAPLE LEAFS', abbr:'TOR', pri:'#00205B', sec:'#FFFFFF'},
+  {name:'BLACKHAWKS',  abbr:'CHI', pri:'#CF0A2C', sec:'#FF6720'},
+  {name:'RED WINGS',   abbr:'DET', pri:'#CE1126', sec:'#FFFFFF'},
+];
+const PU_TYPES=[
+  {type:'speed', color:'#FFD700', label:'SPD', msg:'SPEED BOOST!'},
+  {type:'power', color:'#FF4444', label:'PWR', msg:'POWER SHOT!'},
+  {type:'freeze',color:'#44CCFF', label:'FRZ', msg:'FREEZE!'},
+  {type:'big',   color:'#CC44FF', label:'BIG', msg:'BIG PUCK!'},
+];
+
+// ─────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const norm=(dx,dy)=>{const d=Math.hypot(dx,dy)||1;return[dx/d,dy/d];};
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const rndI=(a,b)=>Math.floor(rnd(a,b+1));
+
+// Trace the rounded-corner rink outline as a canvas path
+function rinkPath(ctx){
+  const r=RINK_R;
+  ctx.beginPath();
+  ctx.moveTo(RX+r,RY);ctx.lineTo(RX+RW-r,RY);
+  ctx.arcTo(RX+RW,RY,    RX+RW,RY+r,       r);
+  ctx.lineTo(RX+RW,RY+RH-r);
+  ctx.arcTo(RX+RW,RY+RH, RX+RW-r,RY+RH,    r);
+  ctx.lineTo(RX+r,RY+RH);
+  ctx.arcTo(RX,RY+RH,    RX,RY+RH-r,        r);
+  ctx.lineTo(RX,RY+r);
+  ctx.arcTo(RX,RY,       RX+r,RY,            r);
+  ctx.closePath();
+}
+// Push player/puck out of rounded corners and reflect velocity
+function applyCornerBounds(obj,r){
+  const cr=RINK_R;
+  const cx1=RX+cr,cx2=RX+RW-cr,cy1=RY+cr,cy2=RY+RH-cr;
+  let ccx=null,ccy=null;
+  if(obj.x<cx1&&obj.y<cy1){ccx=cx1;ccy=cy1;}
+  else if(obj.x>cx2&&obj.y<cy1){ccx=cx2;ccy=cy1;}
+  else if(obj.x<cx1&&obj.y>cy2){ccx=cx1;ccy=cy2;}
+  else if(obj.x>cx2&&obj.y>cy2){ccx=cx2;ccy=cy2;}
+  if(ccx===null)return;
+  const dx=obj.x-ccx,dy=obj.y-ccy,d=Math.hypot(dx,dy)||1;
+  const maxD=cr-r;
+  if(d>maxD){
+    obj.x=ccx+dx/d*maxD;obj.y=ccy+dy/d*maxD;
+    if(obj.vx!==undefined){
+      const nx=dx/d,ny=dy/d,dot=obj.vx*nx+obj.vy*ny;
+      if(dot>0){obj.vx-=2*dot*nx*.65;obj.vy-=2*dot*ny*.65;}
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// INPUT
+// ─────────────────────────────────────────────
+const Keys={_d:{},_p:{},
+  init(){
+    addEventListener('keydown',e=>{
+      if(!this._d[e.code])this._p[e.code]=true;
+      this._d[e.code]=true;
+      if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Tab'].includes(e.code))e.preventDefault();
+    });
+    addEventListener('keyup',e=>{this._d[e.code]=false;});
+  },
+  down(c){return!!this._d[c];},
+  pressed(c){return!!this._p[c];},
+  flush(){this._p={};}
+};
+
+// ─────────────────────────────────────────────
+// AUDIO
+// ─────────────────────────────────────────────
+let _ac=null;
+function ac(){return _ac||(_ac=new(window.AudioContext||window.webkitAudioContext)());}
+function tone(freq,dur,type='square',vol=0.08){
+  try{
+    const o=ac().createOscillator(),g=ac().createGain();
+    o.connect(g);g.connect(ac().destination);
+    o.type=type;o.frequency.value=freq;
+    g.gain.setValueAtTime(vol,ac().currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,ac().currentTime+dur);
+    o.start();o.stop(ac().currentTime+dur);
+  }catch(e){}
+}
+const SFX={
+  goal(){tone(523,.08);setTimeout(()=>tone(659,.08),80);setTimeout(()=>tone(784,.25,'sawtooth',.15),160);},
+  whistle(){tone(1175,.3,'sine',.12);},
+  hit(){tone(120,.08,'sawtooth',.18);},
+  punch(){tone(180,.07,'sawtooth',.15);},
+  puck(){tone(400,.04,'sine',.05);},
+};
+
+// ─────────────────────────────────────────────
+// PUCK
+// ─────────────────────────────────────────────
+class Puck{
+  constructor(){this.x=RCX;this.y=RCY;this.vx=0;this.vy=0;this.owner=null;this.big=false;this.frozen=0;}
+  get r(){return this.big?PUCK_R*2.5:PUCK_R;}
+  reset(){this.x=RCX;this.y=RCY;this.vx=rnd(-2,2);this.vy=rnd(-1,1);this.owner=null;this.big=false;this.frozen=0;}
+  update(dt){
+    if(this.owner){
+      const a=this.owner.angle;
+      this.x=this.owner.x+Math.cos(a)*(PR+this.r+2);
+      this.y=this.owner.y+Math.sin(a)*(PR+this.r+2);
+      return;
+    }
+    if(this.frozen>0){this.frozen-=dt;return;}
+    this.x+=this.vx*dt*60;
+    this.y+=this.vy*dt*60;
+    this.vx*=0.987;this.vy*=0.987;
+    const r=this.r;
+    // Only bounce off left/right boards when NOT in front of the goal mouth
+    const inGoalY=this.y>GOAL_Y&&this.y<GOAL_Y+GOAL_H;
+    if(this.x-r<RX&&!inGoalY){this.x=RX+r;this.vx=Math.abs(this.vx)*.7;SFX.puck();}
+    if(this.x+r>RX+RW&&!inGoalY){this.x=RX+RW-r;this.vx=-Math.abs(this.vx)*.7;SFX.puck();}
+    if(this.y-r<RY){this.y=RY+r;this.vy=Math.abs(this.vy)*.7;}
+    if(this.y+r>RY+RH){this.y=RY+RH-r;this.vy=-Math.abs(this.vy)*.7;}
+    applyCornerBounds(this,r);
+  }
+}
+
+// ─────────────────────────────────────────────
+// PLAYER
+// ─────────────────────────────────────────────
+class Player{
+  constructor(team,num,x,y,side,role){
+    this.team=team;this.num=num;
+    this.x=x;this.y=y;this.hx=x;this.hy=y;
+    this.vx=0;this.vy=0;this.angle=side==='left'?0:Math.PI;
+    this.side=side;this.role=role;
+    this.isAI=true;this.controlled=false;
+    this.speed=role==='goalie'?3.2:2.8;
+    this.penTimer=0;this.inBox=false;
+    this.pu=null;this.puTimer=0;
+    this.stun=0;this.frozen=0;this.checkCD=0;
+    this.aiShootTimer=rnd(1,3);
+    this.r=PR;
+  }
+  get spd(){return this.pu==='speed'?this.speed*1.75:this.speed;}
+  givePenalty(s){this.penTimer=s;this.inBox=true;this.vx=0;this.vy=0;if(G&&G.puck&&G.puck.owner===this)G.puck.owner=null;}
+  applyPU(type){
+    this.pu=type;this.puTimer=PU_DUR;
+    if(type==='freeze'){
+      const opp=G.opponents(this);
+      opp.forEach(p=>{p.frozen=3;if(p===G.puck?.owner)G.puck.owner=null;});
+    }
+    if(type==='big'&&G.puck)G.puck.big=true;
+  }
+  update(dt,puck,all){
+    if(this.inBox){
+      this.penTimer-=dt;
+      if(this.penTimer<=0){this.inBox=false;this.penTimer=0;this.x=this.hx;this.y=this.hy;}
+      return;
+    }
+    if(this.stun>0){this.stun-=dt;this.vx*=.9;this.vy*=.9;}
+    if(this.frozen>0){this.frozen-=dt;this.vx=0;this.vy=0;return;}
+    if(this.puTimer>0){this.puTimer-=dt;if(this.puTimer<=0)this.pu=null;}
+    if(this.checkCD>0)this.checkCD-=dt;
+    if(this.isAI)this._ai(dt,puck,all);
+    this.x+=this.vx*dt*60;
+    this.y+=this.vy*dt*60;
+    this.x=clamp(this.x,RX+PR,RX+RW-PR);
+    this.y=clamp(this.y,RY+PR,RY+RH-PR);
+    applyCornerBounds(this,PR);
+  }
+  _ai(dt,puck,all){
+    const hasPuck=puck.owner===this;
+    const teamPuck=puck.owner&&puck.owner.team===this.team;
+    const spd=this.spd;
+    let tx,ty;
+    if(this.role==='goalie'){
+      if(hasPuck){
+        this.aiShootTimer-=dt;
+        if(this.aiShootTimer<=0){
+          const passed=this._goaliePass(puck);
+          // If lane blocked, retry quickly; otherwise normal cooldown
+          this.aiShootTimer=passed?rnd(1.0,1.8):rnd(0.3,0.5);
+        }
+        tx=this.side==='left'?RX+22:RX+RW-22;ty=RCY;
+      }else{
+        tx=this.side==='left'?RX+22:RX+RW-22;
+        ty=clamp(puck.y,GOAL_Y+12,GOAL_Y+GOAL_H-12);
+      }
+    }else if(hasPuck){
+      const gx=this.side==='left'?RX+RW-10:RX+10;
+      tx=gx; ty=RCY+Math.sin(Date.now()/900+this.num)*55;
+      this.aiShootTimer-=dt;
+      if(this.aiShootTimer<=0){
+        const d=Math.abs(this.x-gx);
+        if(d<200){
+          if(Math.random()<0.28)this._aiPass(puck);
+          else this._aiShoot(puck);
+          this.aiShootTimer=rnd(1.4,2.8);
+        }else this.aiShootTimer=0.5;
+      }
+    }else if(teamPuck){
+      if(this.role==='forward'){
+        const gx=this.side==='left'?RX+RW-50:RX+50;
+        tx=gx;ty=RCY+(this.num%2===0?70:-70);
+      }else{tx=this.hx;ty=this.hy;}
+    }else{
+      if(this.role==='forward'||dist(this,puck)<130){
+        tx=puck.x+rnd(-15,15);ty=puck.y+rnd(-15,15);
+      }else{
+        const mid=this.side==='left'?RX+RW*.35:RX+RW*.65;
+        tx=clamp(puck.x,this.side==='left'?RX:mid,this.side==='left'?mid:RX+RW);
+        ty=clamp(puck.y,RY+25,RY+RH-25);
+        tx=tx*.7+this.hx*.3;ty=ty*.7+this.hy*.3;
+      }
+    }
+    if(tx!==undefined){
+      const dx=tx-this.x,dy=ty-this.y,d=Math.hypot(dx,dy)||1;
+      if(d>4){const s=spd*.13;this.vx=dx/d*s;this.vy=dy/d*s;this.angle=Math.atan2(dy,dx);}
+      else{this.vx*=.8;this.vy*=.8;}
+    }
+  }
+  _aiShoot(puck){
+    if(puck.owner!==this)return;
+    puck.owner=null;
+    const gx=this.side==='left'?RX+RW:RX;
+    const gy=RCY+rnd(-25,25);
+    const[dx,dy]=norm(gx-this.x,gy-this.y);
+    const pow=this.pu==='power'?13:rnd(5.5,8.5);
+    puck.vx=dx*pow;puck.vy=dy*pow;
+  }
+  _aiPass(puck){
+    if(puck.owner!==this)return;
+    const myArr=G.left.includes(this)?G.left:G.right;
+    const mates=myArr.filter(t=>t!==this&&!t.inBox&&t.role!=='goalie');
+    if(!mates.length){if(this.role!=='goalie')this._aiShoot(puck);return;}
+    // Prefer teammate closer to opponent goal; goalie uses unlimited range
+    const maxDist=this.role==='goalie'?9999:180;
+    let best=null,bestScore=-Infinity;
+    for(const t of mates){
+      const d=dist(this,t);
+      if(d>maxDist)continue;
+      const prog=this.side==='left'?(t.x-this.x):(this.x-t.x);
+      const score=prog*0.7-d*0.3;
+      if(score>bestScore){bestScore=score;best=t;}
+    }
+    if(!best){if(this.role!=='goalie')this._aiShoot(puck);return;}
+    puck.owner=null;
+    const[dx,dy]=norm(best.x-this.x,best.y-this.y);
+    puck.vx=dx*rnd(4.5,6.5);puck.vy=dy*rnd(4.5,6.5);
+  }
+  // Goalie-specific pass: lane-checked, defender-preferred, faster puck
+  _goaliePass(puck){
+    if(puck.owner!==this)return false;
+    const myArr=G.left.includes(this)?G.left:G.right;
+    const mates=myArr.filter(t=>t!==this&&!t.inBox&&t.role!=='goalie');
+    if(!mates.length)return false;
+    const opps=G.opponents(this);
+    let best=null,bestScore=-Infinity;
+    for(const t of mates){
+      const d=dist(this,t);
+      if(d>340)continue;
+      // Reject if any opponent is within 30px of the straight pass line
+      const ldx=t.x-this.x,ldy=t.y-this.y,len=Math.hypot(ldx,ldy)||1;
+      const lnx=ldx/len,lny=ldy/len;
+      let blocked=false;
+      for(const op of opps){
+        const odx=op.x-this.x,ody=op.y-this.y;
+        const along=odx*lnx+ody*lny;
+        if(along<0||along>len)continue;
+        if(Math.abs(odx*lny-ody*lnx)<30){blocked=true;break;}
+      }
+      if(blocked)continue;
+      // Prefer defenders; penalise distance
+      const score=(t.role==='defender'?80:0)-d;
+      if(score>bestScore){bestScore=score;best=t;}
+    }
+    if(!best)return false; // no clear lane — hold and retry
+    puck.owner=null;
+    const[dx,dy]=norm(best.x-this.x,best.y-this.y);
+    puck.vx=dx*rnd(7,9);puck.vy=dy*rnd(7,9);
+    return true;
+  }
+}
+
+// ─────────────────────────────────────────────
+// POWER-UP ITEM
+// ─────────────────────────────────────────────
+class PUItem{
+  constructor(){
+    const t=PU_TYPES[rndI(0,PU_TYPES.length-1)];
+    Object.assign(this,t);
+    this.x=rnd(RX+RW*.3,RX+RW*.7);
+    this.y=rnd(RY+RH*.2,RY+RH*.8);
+    this.bob=0;this.gone=false;this.r=12;
+  }
+  update(dt){this.bob+=dt*3;}
+  draw(ctx){
+    if(this.gone)return;
+    const by=Math.sin(this.bob)*3;
+    ctx.save();ctx.translate(this.x,this.y+by);
+    ctx.shadowColor=this.color;ctx.shadowBlur=16;
+    ctx.beginPath();ctx.arc(0,0,this.r,0,Math.PI*2);
+    ctx.fillStyle=this.color;ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.stroke();
+    ctx.shadowBlur=0;ctx.fillStyle='#000';
+    ctx.font='bold 8px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(this.label,0,0);
+    ctx.restore();
+  }
+}
+
+// ─────────────────────────────────────────────
+// FIGHT SCENE
+// ─────────────────────────────────────────────
+class Fight{
+  constructor(fp1,fp2,cb){
+    this.fp1=fp1;this.fp2=fp2;this.cb=cb;
+    this.hp=[5,5];this.punchTimer=[0,0];this.punchSide=[0,0];
+    this.cooldown=[0,0];this.aiTimer=rnd(.6,1.4);
+    this.winner=null;this.endTimer=0;
+    this.flash=0;this.msg='';this.msgT=0;
+  }
+  punch(who,side){
+    if(this.winner!==null)return;
+    if(this.cooldown[who]>0)return;
+    SFX.punch();
+    const other=1-who;
+    this.punchTimer[who]=0.3;this.punchSide[who]=side;this.cooldown[who]=0.45;
+    if(this.punchTimer[other]>0.12){
+      this.hp[0]--;this.hp[1]--;this.showMsg('CLASH!');
+    }else{
+      this.hp[other]--;
+      this.showMsg(who===0?(side<0?'LEFT JAB!':'RIGHT HOOK!'):'OOF!');
+    }
+    this.hp[0]=Math.max(0,this.hp[0]);this.hp[1]=Math.max(0,this.hp[1]);
+    this.flash=0.12;
+    if(this.hp[0]<=0||this.hp[1]<=0){
+      this.winner=this.hp[1]<=0?0:1;
+      this.endTimer=2.2;
+    }
+  }
+  showMsg(m){this.msg=m;this.msgT=0.9;}
+  update(dt){
+    if(this.flash>0)this.flash-=dt;
+    if(this.msgT>0)this.msgT-=dt;
+    for(let i=0;i<2;i++){if(this.punchTimer[i]>0)this.punchTimer[i]-=dt;if(this.cooldown[i]>0)this.cooldown[i]-=dt;}
+    if(this.winner!==null){this.endTimer-=dt;if(this.endTimer<=0)this.cb(this.winner,this.fp1,this.fp2);return;}
+    if(Keys.pressed('KeyZ'))this.punch(0,-1);
+    if(Keys.pressed('KeyX'))this.punch(0,1);
+    this.aiTimer-=dt;
+    if(this.aiTimer<=0){this.punch(1,Math.random()<.5?-1:1);this.aiTimer=rnd(.4,1.2);}
+  }
+  draw(ctx){
+    ctx.fillStyle='rgba(0,0,0,.88)';ctx.fillRect(0,0,W,H);
+    if(this.flash>0){ctx.fillStyle=`rgba(255,255,255,${this.flash*2})`;ctx.fillRect(0,0,W,H);}
+    const cx=W/2,cy=H/2;
+    ctx.fillStyle='#FFD700';ctx.font='bold 52px monospace';ctx.textAlign='center';
+    ctx.fillText('FIGHT!',cx,cy-155);
+    this._drawFighter(ctx,cx-160,cy,false,0);
+    this._drawFighter(ctx,cx+160,cy,true,1);
+    ctx.fillStyle='#fff';ctx.font='bold 22px monospace';ctx.fillText('VS',cx,cy+10);
+    if(this.msgT>0){
+      const a=Math.min(1,this.msgT*2);
+      ctx.fillStyle=`rgba(255,220,0,${a})`;ctx.font='bold 26px monospace';
+      ctx.fillText(this.msg,cx,cy-85);
+    }
+    ctx.fillStyle='#666';ctx.font='13px monospace';
+    ctx.fillText('Z: LEFT PUNCH   X: RIGHT PUNCH',cx,cy+180);
+    if(this.winner!==null){
+      ctx.fillStyle='#FFD700';ctx.font='bold 34px monospace';
+      ctx.fillText(this.winner===0?'YOU WIN! PENALTY ON AI!':'AI WINS! YOU GET THE BOX!',cx,cy+120);
+    }
+  }
+  _drawFighter(ctx,x,y,flip,idx){
+    const p=idx===0?this.fp1:this.fp2;
+    const t=TEAMS[p.team];
+    const hp=this.hp[idx];
+    ctx.save();ctx.translate(x,y);if(flip)ctx.scale(-1,1);
+    // Body
+    ctx.fillStyle=t.pri;ctx.fillRect(-18,-40,36,58);
+    // Head
+    ctx.fillStyle='#f5c5a0';ctx.beginPath();ctx.arc(0,-56,18,0,Math.PI*2);ctx.fill();
+    // Helmet
+    ctx.fillStyle=t.pri;ctx.beginPath();ctx.arc(0,-58,18,Math.PI,Math.PI*2);ctx.fill();
+    // Number on jersey
+    ctx.fillStyle=t.sec;ctx.font='bold 14px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(p.num,0,-18);
+    // Arms
+    const pt=this.punchTimer[idx];const ps=this.punchSide[idx];
+    if(pt>0){
+      const ext=pt/0.3*28;
+      ctx.fillStyle=t.pri;
+      const ax=ps>0?18:-18-ext+10;
+      ctx.fillRect(ax,-28,ext,10);
+      ctx.fillStyle='#f5c5a0';
+      ctx.beginPath();ctx.arc(ps>0?18+ext:-18-ext,-23,7,0,Math.PI*2);ctx.fill();
+    }else{
+      ctx.fillStyle=t.pri;ctx.fillRect(-26,-30,10,22);ctx.fillRect(16,-30,10,22);
+    }
+    // Legs
+    ctx.fillStyle=t.sec;ctx.fillRect(-16,18,12,28);ctx.fillRect(4,18,12,28);
+    // HP bar
+    const bw=56,bx=-bw/2;
+    ctx.fillStyle='#333';ctx.fillRect(bx,-88,bw,8);
+    ctx.fillStyle=hp>2?'#00DD00':hp>1?'#FFAA00':'#FF2200';
+    ctx.fillRect(bx,-88,bw*(hp/5),8);
+    ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.strokeRect(bx,-88,bw,8);
+    // Pips
+    for(let i=0;i<5;i++){
+      ctx.fillStyle=i<hp?'#FFD700':'#333';
+      ctx.beginPath();ctx.arc(-20+i*10,-100,4,0,Math.PI*2);ctx.fill();
+    }
+    // Label
+    ctx.fillStyle='#ccc';ctx.font='11px monospace';
+    ctx.fillText(t.abbr+' #'+p.num,0,56);
+    ctx.restore();
+  }
+}
+
+// ─────────────────────────────────────────────
+// GAME
+// ─────────────────────────────────────────────
+let G=null;
+class Game{
+  constructor(canvas){
+    G=this;
+    this.canvas=canvas;
+    this.ctx=canvas.getContext('2d');
+    this.state='title';
+    this.sel=0;this.oppTeam=1;
+    this.blink=0;this.menuSel=0;
+    this.scores=[0,0];this.period=1;this.clock=PERIOD_SEC;
+    this.paused=false;
+    this.goalT=0;this.goalTeam=-1;
+    this.flash=0;
+    this.ann='';this.annT=0;
+    this.puck=null;this.players=[];this.left=[];this.right=[];
+    this.puItems=[];this.puSpawn=PU_SPAWN;
+    this.fight=null;
+    this.challenge=null;
+    this.challengeCD=0;
+    this.goaliePuckTimer=0;
+    this.isOT=false;
+    this.so=null;
+    this.crowd=this._genCrowd();
+    this.p1=null;
+    Keys.init();
+  }
+  opponents(p){return p.team===this.sel?this.right:this.left;}
+  announce(msg,t=2){this.ann=msg;this.annT=t;}
+
+  initGame(){
+    const t1=this.sel,t2=this.oppTeam;
+    // Home positions — where AI players return to when not chasing puck
+    const lh=[ // left team (LW, C, RW, LD, RD, G)
+      [RX+RW*.42,RCY-72],[RX+RW*.40,RCY],[RX+RW*.42,RCY+72],
+      [RX+RW*.22,RCY-42],[RX+RW*.22,RCY+42],
+      [RX+24,    RCY],
+    ];
+    const rh=[ // right team
+      [RX+RW*.58,RCY-72],[RX+RW*.60,RCY],[RX+RW*.58,RCY+72],
+      [RX+RW*.78,RCY-42],[RX+RW*.78,RCY+42],
+      [RX+RW-24, RCY],
+    ];
+    const mk=(team,num,hx,hy,side,role)=>{
+      const p=new Player(team,num,hx,hy,side,role);p.hx=hx;p.hy=hy;return p;
+    };
+    this.left=[
+      mk(t1,11,lh[0][0],lh[0][1],'left','forward'),  // LW
+      mk(t1,15,lh[1][0],lh[1][1],'left','forward'),  // C
+      mk(t1,19,lh[2][0],lh[2][1],'left','forward'),  // RW
+      mk(t1, 4,lh[3][0],lh[3][1],'left','defender'), // LD
+      mk(t1, 7,lh[4][0],lh[4][1],'left','defender'), // RD
+      mk(t1, 1,lh[5][0],lh[5][1],'left','goalie'),
+    ];
+    this.right=[
+      mk(t2,11,rh[0][0],rh[0][1],'right','forward'),
+      mk(t2,15,rh[1][0],rh[1][1],'right','forward'),
+      mk(t2,19,rh[2][0],rh[2][1],'right','forward'),
+      mk(t2, 4,rh[3][0],rh[3][1],'right','defender'),
+      mk(t2, 7,rh[4][0],rh[4][1],'right','defender'),
+      mk(t2, 1,rh[5][0],rh[5][1],'right','goalie'),
+    ];
+    this.players=[...this.left,...this.right];
+    this.puck=new Puck();
+    this.scores=[0,0];this.period=1;this.clock=PERIOD_SEC;
+    this.puItems=[];this.puSpawn=PU_SPAWN;
+    this._setControlled();
+    this._faceoff();
+    this.announce('PERIOD 1 - FACE OFF!');
+  }
+
+  _faceoff(){
+    // Faceoff formation — centers at dot, wings behind, defenders in zone
+    // hx/hy (home) intentionally NOT overwritten — AI uses those for positioning
+    const lf=[
+      [RCX-52,RCY-62],[RCX-9,RCY],[RCX-52,RCY+62],   // LW, C, RW
+      [RX+RW*.22,RCY-42],[RX+RW*.22,RCY+42],            // LD, RD
+      [RX+24,RCY],                                        // G
+    ];
+    const rf=[
+      [RCX+52,RCY-62],[RCX+9,RCY],[RCX+52,RCY+62],
+      [RX+RW*.78,RCY-42],[RX+RW*.78,RCY+42],
+      [RX+RW-24,RCY],
+    ];
+    const pos={left:lf,right:rf};
+    this.left.forEach((p,i)=>{if(!p.inBox){const fp=pos[p.side][i];p.x=fp[0];p.y=fp[1];}p.vx=0;p.vy=0;});
+    this.right.forEach((p,i)=>{if(!p.inBox){const fp=pos[p.side][i];p.x=fp[0];p.y=fp[1];}p.vx=0;p.vy=0;});
+    this.puck.reset();
+    this.challengeCD=4.0;
+    this.goaliePuckTimer=0;
+  }
+
+  _setControlled(prev){
+    const elig=this.left.filter(p=>!p.inBox&&p.role!=='goalie');
+    if(!elig.length){this.p1=this.left[0];return;}
+    // Always follow your own puck carrier
+    if(this.puck&&this.puck.owner&&this.puck.owner.team===this.sel&&this.puck.owner.role!=='goalie'){
+      this._ctrl(this.puck.owner);return;
+    }
+    const pk=this.puck||{x:RCX,y:RCY};
+    const oppHasPuck=this.puck&&this.puck.owner&&this.puck.owner.team===this.oppTeam;
+    // Defensive zone: puck is past 40% mark toward our goal
+    const inDefZone=oppHasPuck&&(this.left[0].side==='left'?pk.x<RX+RW*.4:pk.x>RX+RW*.6);
+    let best=elig[0],bd=Infinity;
+    if(inDefZone){
+      // Prefer defenders; fall back to all skaters if both defenders are in the box
+      const cands=elig.filter(p=>p.role==='defender');
+      const pool=cands.length?cands:elig;
+      for(const p of pool){const d=dist(p,pk);if(d<bd){bd=d;best=p;}}
+      // Switch unless current player is already a defender who is close
+      if(!prev||prev.role!=='defender'||dist(prev,pk)>bd+40)this._ctrl(best);
+    }else{
+      for(const p of elig){const d=dist(p,pk);if(d<bd){bd=d;best=p;}}
+      if(!prev||dist(prev,pk)>bd+35)this._ctrl(best);
+    }
+  }
+  _cyclePlayer(){
+    const elig=this.left.filter(p=>!p.inBox&&p.role!=='goalie');
+    if(elig.length<2)return;
+    const idx=elig.indexOf(this.p1);
+    this._ctrl(elig[(idx+1)%elig.length]);
+  }
+  _ctrl(p){
+    this.p1=p;
+    this.players.forEach(pl=>pl.controlled=false);
+    p.controlled=true;p.isAI=false;
+    this.left.forEach(pl=>{if(pl!==p)pl.isAI=true;});
+  }
+
+  update(dt){
+    this.blink+=dt;
+    const s=this.state;
+    if(s==='title')this._uTitle();
+    else if(s==='teamsel')this._uTeamSel();
+    else if(s==='playing')this._uPlay(dt);
+    else if(s==='fight'){if(this.fight)this.fight.update(dt);else this.state='playing';}
+    else if(s==='challenge')this._uChallenge(dt);
+    else if(s==='periodend')this._uPeriodEnd();
+    else if(s==='gameover')this._uGameOver();
+    else if(s==='shootout')this._uShootout(dt);
+    Keys.flush();
+  }
+
+  _uTitle(){
+    if(Keys.pressed('Space')||Keys.pressed('Enter')||Keys.pressed('KeyZ')){this.state='teamsel';this.menuSel=0;}
+  }
+  _uTeamSel(){
+    if(Keys.pressed('ArrowUp')||Keys.pressed('KeyW'))this.menuSel=(this.menuSel-1+TEAMS.length)%TEAMS.length;
+    if(Keys.pressed('ArrowDown')||Keys.pressed('KeyS'))this.menuSel=(this.menuSel+1)%TEAMS.length;
+    if(Keys.pressed('Space')||Keys.pressed('Enter')||Keys.pressed('KeyZ')){
+      this.sel=this.menuSel;
+      do{this.oppTeam=rndI(0,TEAMS.length-1);}while(this.oppTeam===this.sel);
+      this.initGame();this.state='playing';
+    }
+  }
+  _uPeriodEnd(){
+    if(Keys.pressed('Space')||Keys.pressed('Enter')||Keys.pressed('KeyZ')){
+      if(this.period>=NUM_PERIODS&&this.scores[0]===this.scores[1]){
+        this._startOT();
+      }else{
+        this.period++;this.clock=PERIOD_SEC;
+        this._swapSides();
+        this._faceoff();this._setControlled();
+        this.state='playing';
+        this.announce(`PERIOD ${this.period} - FACE OFF!`);
+      }
+    }
+  }
+  _uGameOver(){
+    if(Keys.pressed('Space')||Keys.pressed('Enter')||Keys.pressed('KeyZ'))this.state='title';
+  }
+
+  _uPlay(dt){
+    if(Keys.pressed('KeyP')||Keys.pressed('Escape')){this.paused=!this.paused;}
+    if(this.paused)return;
+    if(this.annT>0)this.annT-=dt;
+    if(this.challengeCD>0)this.challengeCD-=dt;
+    if(this.goalT>0){
+      this.goalT-=dt;
+      if(this.goalT<=0){
+        if(this.isOT){this.state='gameover';}
+        else{this._faceoff();this._setControlled();}
+      }
+      return;
+    }
+    this.clock-=dt;
+    if(this.clock<=0){this.clock=0;this._endPeriod();return;}
+    // spawn powerups
+    this.puSpawn-=dt;
+    if(this.puSpawn<=0&&this.puItems.filter(p=>!p.gone).length<2){
+      this.puItems.push(new PUItem());this.puSpawn=PU_SPAWN+rnd(-5,5);
+    }
+    this.puItems.forEach(p=>p.update(dt));
+    // p1 input
+    this._p1Input(dt);
+    // update all
+    const prev=this.p1;
+    this._setControlled(prev);
+    this.players.forEach(p=>p.update(dt,this.puck,this.players));
+    this.puck.update(dt);
+    // puck pickup
+    if(!this.puck.owner){
+      for(const p of this.players){
+        if(p.inBox)continue;
+        if(dist(p,this.puck)<PR+this.puck.r+2){
+          this.puck.owner=p;SFX.puck();break;
+        }
+      }
+    }
+    // Goalie delay-of-game: faceoff after 5s of possession
+    if(this.puck.owner&&this.puck.owner.role==='goalie'){
+      this.goaliePuckTimer+=dt;
+      if(this.goaliePuckTimer>=5){
+        SFX.whistle();this.goaliePuckTimer=0;
+        this._faceoff();this._setControlled();
+        this.announce('GOALIE DELAY — FACEOFF!',2);
+        return;
+      }
+    }else{this.goaliePuckTimer=0;}
+    // pressure steal
+    if(this.puck.owner){
+      const opp=this.opponents(this.puck.owner);
+      for(const p of opp){
+        if(p.inBox||p.role==='goalie')continue;
+        if(dist(p,this.puck.owner)<PR*2.1){
+          const chance=this.puck.owner===this.p1?.004:.012;
+          if(Math.random()<chance){
+            this.puck.owner=null;
+            this.puck.vx=p.vx*1.5+rnd(-2,2);
+            this.puck.vy=p.vy*1.5+rnd(-2,2);
+          }
+        }
+      }
+    }
+    // collect powerups
+    for(const pu of this.puItems){
+      if(pu.gone)continue;
+      const carrier=this.puck.owner;
+      if(carrier&&dist(carrier,pu)<PR+pu.r){
+        pu.gone=true;carrier.applyPU(pu.type);
+        this.announce(pu.msg,1.5);
+      }
+    }
+    // auto-fight check (AI vs AI proximity)
+    this._checkAIFights();
+    // collisions
+    this._resolveCollisions();
+    // goal check
+    this._checkGoal();
+  }
+
+  _p1Input(dt){
+    const p=this.p1;
+    if(!p||p.inBox||p.frozen>0||p.stun>0)return;
+    let dx=0,dy=0;
+    if(Keys.down('ArrowLeft')||Keys.down('KeyA'))dx-=1;
+    if(Keys.down('ArrowRight')||Keys.down('KeyD'))dx+=1;
+    if(Keys.down('ArrowUp')||Keys.down('KeyW'))dy-=1;
+    if(Keys.down('ArrowDown')||Keys.down('KeyS'))dy+=1;
+    if(dx||dy){
+      const[nx,ny]=norm(dx,dy);const s=p.spd*.15;
+      p.vx=nx*s;p.vy=ny*s;p.angle=Math.atan2(ny,nx);
+    }else{p.vx*=.82;p.vy*=.82;}
+    if(Keys.pressed('Space')&&this.puck.owner===p)this._shoot(p);
+    if(Keys.pressed('KeyZ')&&this.puck.owner===p)this._pass(p);
+    if(Keys.pressed('KeyX')&&p.checkCD<=0)this._bodycheck(p);
+    if(Keys.pressed('KeyF'))this._challengeToFight(p);
+    if(Keys.pressed('Tab'))this._cyclePlayer();
+  }
+
+  _shoot(p){
+    if(this.puck.owner!==p)return;
+    this.puck.owner=null;
+    const gx=p.side==='left'?RX+RW+5:RX-5;
+    const gy=RCY+rnd(-GOAL_H*.35,GOAL_H*.35);
+    const[dx,dy]=norm(gx-p.x,gy-p.y);
+    const pow=p.pu==='power'?14.5:rnd(8,11.5);
+    this.puck.vx=dx*pow;this.puck.vy=dy*pow;
+  }
+
+  _pass(p){
+    if(this.puck.owner!==p)return;
+    const mates=this.left.filter(t=>t!==p&&!t.inBox&&t.role!=='goalie');
+    if(!mates.length)return;
+    let best=null,bestScore=-Infinity;
+    for(const t of mates){
+      const d=dist(p,t);
+      if(d>270)continue;
+      // Prefer teammates further toward opponent goal and closer
+      const progress=p.side==='left'?(t.x-p.x):(p.x-t.x);
+      const score=progress*0.8-d*0.4;
+      if(score>bestScore){bestScore=score;best=t;}
+    }
+    if(!best)return;
+    this.puck.owner=null;
+    // Lead the pass ahead of the receiver's movement
+    const tx=best.x+best.vx*18, ty=best.y+best.vy*18;
+    const[dx,dy]=norm(tx-p.x,ty-p.y);
+    this.puck.vx=dx*rnd(5,7);this.puck.vy=dy*rnd(5,7);
+    this.announce('PASS!',0.6);
+    SFX.puck();
+  }
+
+  _bodycheck(p){
+    p.checkCD=0.9;
+    const opp=this.opponents(p);
+    let near=null,nd=PR*4.5;
+    for(const op of opp){if(op.inBox||op.role==='goalie')continue;const d=dist(p,op);if(d<nd){nd=d;near=op;}}
+    if(near&&nd<PR*4){
+      SFX.hit();
+      const[nx,ny]=norm(near.x-p.x,near.y-p.y);
+      near.vx+=nx*4;near.vy+=ny*4;near.stun=1.0;
+      if(this.puck.owner===near&&Math.random()<0.55){
+        this.puck.owner=null;this.puck.vx=nx*3+rnd(-1,1);this.puck.vy=ny*3+rnd(-1,1);
+      }
+      p.vx+=Math.cos(p.angle)*2;p.vy+=Math.sin(p.angle)*2;
+      this.announce('BODYCHECK!',0.7);
+    }else{p.vx+=Math.cos(p.angle)*2.5;p.vy+=Math.sin(p.angle)*2.5;}
+  }
+
+  _challengeToFight(p){
+    if(this.state!=='playing')return;
+    const opp=this.opponents(p);
+    let near=null,nd=PR*6;
+    for(const op of opp){if(op.inBox||op.role==='goalie')continue;const d=dist(p,op);if(d<nd){nd=d;near=op;}}
+    if(near&&nd<PR*6)this._startChallenge(p,near);
+    else this.announce('NO ONE NEARBY!',0.8);
+  }
+
+  _startChallenge(challenger,challenged){
+    if(this.state!=='playing')return;
+    const p2IsHuman=challenged===this.p1;
+    this.challenge={
+      p1:challenger,p2:challenged,p2IsHuman,
+      timer:3.0,p2Choice:null,
+      aiTimer:rnd(0.8,2.2),
+      result:null,resultTimer:0,
+    };
+    this.state='challenge';
+  }
+
+  _uChallenge(dt){
+    const ch=this.challenge;
+    if(!ch){this.state='playing';return;}
+    // Result flash phase — wait then transition
+    if(ch.result!==null){
+      ch.resultTimer-=dt;
+      if(ch.resultTimer<=0){
+        const p1=ch.p1,p2=ch.p2;
+        this.challenge=null;
+        this.challengeCD=4.0;
+        if(ch.result==='fight')this._startFight(p1,p2);
+        else this.state='playing';
+      }
+      return;
+    }
+    ch.timer-=dt;
+    if(ch.p2IsHuman){
+      if(Keys.pressed('KeyF'))ch.p2Choice=true;
+      else if(Keys.pressed('Space'))ch.p2Choice=false;
+    }else{
+      ch.aiTimer-=dt;
+      if(ch.aiTimer<=0&&ch.p2Choice===null)ch.p2Choice=Math.random()<0.60;
+    }
+    if(ch.timer<=0||ch.p2Choice!==null){
+      const accepted=ch.p2Choice===true;
+      ch.result=accepted?'fight':'declined';
+      ch.resultTimer=1.4;
+      if(accepted){SFX.whistle();}
+    }
+  }
+
+  _startFight(p1,p2){
+    SFX.whistle();
+    this.fight=new Fight(p1,p2,(winner,fp1,fp2)=>{
+      const loser=winner===0?fp2:fp1;
+      loser.givePenalty(PENALTY_SEC);
+      this.fight=null;this.state='playing';
+      this._faceoff();this._setControlled();
+      const ln=TEAMS[loser.team].abbr;
+      this.announce(`${ln} #${loser.num} GOES TO THE BOX!`);
+    });
+    this.state='fight';
+  }
+
+  _checkAIFights(){
+    if(this.state!=='playing')return;
+    // AI vs AI — quick silent resolution (neither side is human)
+    for(const lp of this.left){
+      if(lp.inBox||lp===this.p1||lp.role==='goalie')continue;
+      for(const rp of this.right){
+        if(rp.inBox||rp.role==='goalie')continue;
+        if(dist(lp,rp)<PR*2&&Math.random()<.003){
+          if(Math.random()<0.5){
+            const loser=Math.random()<.5?lp:rp;
+            loser.givePenalty(PENALTY_SEC*.6);
+            this.announce('FIGHT! PENALTY!',1.5);SFX.whistle();
+          }
+        }
+      }
+    }
+  }
+
+  _checkGoal(){
+    if(this.goalT>0)return;
+    const pk=this.puck,r=pk.r;
+    const pSide=this.left[0].side; // 'left'=player attacks right goal, 'right'=player attacks left goal
+    if(pk.x-r<RX&&pk.y>GOAL_Y&&pk.y<GOAL_Y+GOAL_H){
+      this._score(pSide==='right'?0:1); // left goal: player scores if they attack left
+      return;
+    }
+    if(pk.x+r>RX+RW&&pk.y>GOAL_Y&&pk.y<GOAL_Y+GOAL_H){
+      this._score(pSide==='left'?0:1); // right goal: player scores if they attack right
+      return;
+    }
+  }
+
+  _score(team){
+    this.scores[team]++;
+    this.goalT=3.5;this.goalTeam=team;
+    this.puck.owner=null;this.puck.vx=0;this.puck.vy=0;
+    this.flash=0.6;SFX.goal();
+    this.puck.big=false;
+    const tn=team===0?TEAMS[this.sel].name:TEAMS[this.oppTeam].name;
+    this.announce(`GOAL! ${tn}!`,3);
+  }
+
+  _endPeriod(){
+    SFX.whistle();
+    if(this.isOT){this._startShootout();return;}
+    if(this.period>=NUM_PERIODS){
+      this.state=this.scores[0]===this.scores[1]?'periodend':'gameover';
+    }else{
+      this.state='periodend';
+    }
+  }
+
+  _resolveCollisions(){
+    const pl=this.players;
+    for(let i=0;i<pl.length;i++){
+      for(let j=i+1;j<pl.length;j++){
+        const a=pl[i],b=pl[j];
+        if(a.inBox||b.inBox)continue;
+        const d=dist(a,b);
+        if(d<PR*2){
+          const dx=b.x-a.x,dy=b.y-a.y;
+          const[nx,ny]=norm(dx,dy);
+          const ov=(PR*2-d)*.5;
+          if(a.team===b.team){
+            // Teammates: soft separation only — no bounce, no puck knock
+            a.x-=nx*ov*.35;a.y-=ny*ov*.35;
+            b.x+=nx*ov*.35;b.y+=ny*ov*.35;
+          }else{
+            // Opponents: full separation + velocity exchange + puck loose
+            a.x-=nx*ov;a.y-=ny*ov;b.x+=nx*ov;b.y+=ny*ov;
+            const rv=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+            if(rv<0){a.vx-=nx*rv*.25;a.vy-=ny*rv*.25;b.vx+=nx*rv*.25;b.vy+=ny*rv*.25;}
+            if((this.puck.owner===a||this.puck.owner===b)&&Math.abs(rv)>.4&&Math.random()<.25){
+              this.puck.owner=null;
+              this.puck.vx=(a.vx+b.vx)*.5;this.puck.vy=(a.vy+b.vy)*.5;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // DRAW
+  // ─────────────────────────────────────────────
+  draw(){
+    const ctx=this.ctx;
+    ctx.clearRect(0,0,W,H);
+    const s=this.state;
+    if(s==='title')this._dTitle(ctx);
+    else if(s==='teamsel')this._dTeamSel(ctx);
+    else{
+      this._dGame(ctx);
+      if(s==='fight'&&this.fight)this.fight.draw(ctx);
+      else if(s==='challenge')this._dChallenge(ctx);
+      else if(s==='periodend')this._dPeriodEnd(ctx);
+      else if(s==='gameover')this._dGameOver(ctx);
+      else if(s==='shootout')this._dShootoutOverlay(ctx);
+    }
+  }
+
+  _genCrowd(){
+    const out=[];
+    const pal=['#CC3333','#4466CC','#449933','#AA44AA','#CCAA22','#888','#FF8800','#226688','#993322','#228866'];
+    const add=(x,y)=>out.push({x:x+rnd(-2,2),y:y+rnd(-2,2),c:pal[Math.floor(Math.random()*pal.length)],ph:Math.random()*Math.PI*2});
+    // Left stand — beside left goal (behind goal glass)
+    for(let col=0;col<4;col++){const x=6+col*14;for(let row=0;row<22;row++)add(x,RY+10+row*16);}
+    // Right stand — beside right goal
+    for(let col=0;col<4;col++){const x=RX+RW+14+col*14;for(let row=0;row<22;row++)add(x,RY+10+row*16);}
+    return out;
+  }
+  _dStands(ctx){
+    // Left stand background
+    ctx.fillStyle='#111827';ctx.fillRect(0,RY,RX,RH);
+    for(let y=RY+8;y<RY+RH;y+=16){ctx.fillStyle='rgba(255,255,255,.04)';ctx.fillRect(0,y,RX,1);}
+    // Right stand background
+    ctx.fillStyle='#111827';ctx.fillRect(RX+RW,RY,W-(RX+RW),RH);
+    for(let y=RY+8;y<RY+RH;y+=16){ctx.fillStyle='rgba(255,255,255,.04)';ctx.fillRect(RX+RW,y,W-(RX+RW),1);}
+  }
+  _dCrowd(ctx){
+    const t=Date.now()/1000;
+    const cheer=this.goalT>0;
+    for(const sp of this.crowd){
+      const wave=cheer?Math.sin(t*6+sp.ph)*6:0;
+      const py=sp.y+wave;
+      // Body
+      ctx.fillStyle=cheer?`hsl(${45+Math.sin(t*4+sp.ph)*15},100%,55%)`:sp.c;
+      ctx.fillRect(sp.x-2,py,5,7);
+      // Head
+      ctx.fillStyle='#c8956a';
+      ctx.beginPath();ctx.arc(sp.x+0.5,py-3,3,0,Math.PI*2);ctx.fill();
+      // Arms raised when cheering
+      if(cheer){
+        const up=Math.sin(t*5+sp.ph)>.2;
+        ctx.strokeStyle=ctx.fillStyle='#FFD700';ctx.lineWidth=1.5;
+        if(up){
+          ctx.beginPath();ctx.moveTo(sp.x-2,py+1);ctx.lineTo(sp.x-5,py-4);ctx.stroke();
+          ctx.beginPath();ctx.moveTo(sp.x+3,py+1);ctx.lineTo(sp.x+6,py-4);ctx.stroke();
+        }
+      }
+    }
+  }
+
+  _dTitle(ctx){
+    ctx.fillStyle='#000a1a';ctx.fillRect(0,0,W,H);
+    // Stars
+    for(let i=0;i<60;i++){
+      if(Math.sin(this.blink*2+i*1.3)>.2){
+        ctx.fillStyle='#fff';ctx.fillRect((i*97+17)%790,(i*53+11)%540,2,2);
+      }
+    }
+    // Ice preview (rounded)
+    rinkPath(ctx);ctx.fillStyle='rgba(180,210,240,.15)';ctx.fill();
+    rinkPath(ctx);ctx.strokeStyle='rgba(255,255,255,.2)';ctx.lineWidth=4;ctx.stroke();
+    // Title box
+    ctx.fillStyle='#000033';ctx.fillRect(140,125,520,140);
+    ctx.strokeStyle='#FFD700';ctx.lineWidth=3;ctx.strokeRect(140,125,520,140);
+    ctx.fillStyle='#FFD700';ctx.font='bold 36px monospace';ctx.textAlign='center';
+    ctx.fillText('ROCKEMSOCKEM',W/2,185);
+    ctx.fillStyle='#FFFFFF';ctx.font='bold 30px monospace';
+    ctx.fillText('ICE FURY',W/2,222);
+    ctx.fillStyle='#4488FF';ctx.font='bold 18px monospace';
+    ctx.fillText('ORIGINAL 6',W/2,248);
+    // Blinking prompt
+    if(Math.sin(this.blink*3)>.1){
+      ctx.fillStyle='#fff';ctx.font='bold 22px monospace';
+      ctx.fillText('PRESS SPACE TO START',W/2,320);
+    }
+    // Controls
+    ctx.fillStyle='#557';ctx.font='13px monospace';
+    ctx.fillText('ARROWS/WASD: Move   SPACE: Shoot   Z: Pass   X: Bodycheck   F: Challenge   TAB: Switch Player   P: Pause',W/2,415);
+    ctx.fillText('FIGHT (if accepted): Z=Left Punch  X=Right Punch  |  Power-Ups spawn on ice!',W/2,435);
+    // Sticks
+    ctx.strokeStyle='#FFD700';ctx.lineWidth=5;
+    ctx.beginPath();ctx.moveTo(90,320);ctx.lineTo(160,200);ctx.lineTo(185,200);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(710,320);ctx.lineTo(640,200);ctx.lineTo(615,200);ctx.stroke();
+  }
+
+  _dTeamSel(ctx){
+    ctx.fillStyle='#00001a';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#FFD700';ctx.font='bold 30px monospace';ctx.textAlign='center';
+    ctx.fillText('SELECT YOUR TEAM',W/2,52);
+    ctx.fillStyle='#555';ctx.font='13px monospace';
+    ctx.fillText('UP/DOWN to select   SPACE/Z to confirm',W/2,80);
+    TEAMS.forEach((t,i)=>{
+      const y=115+i*68,sel=i===this.menuSel;
+      ctx.fillStyle=sel?t.pri:'#111122';
+      ctx.fillRect(140,y,520,58);
+      ctx.strokeStyle=sel?'#FFD700':'#333';ctx.lineWidth=sel?3:1;
+      ctx.strokeRect(140,y,520,58);
+      // Swatch
+      ctx.fillStyle=t.pri;ctx.fillRect(160,y+10,30,38);
+      ctx.fillStyle=t.sec;ctx.fillRect(175,y+10,15,38);
+      ctx.strokeStyle='#444';ctx.lineWidth=1;ctx.strokeRect(160,y+10,30,38);
+      // Name
+      ctx.fillStyle=sel?t.sec:'#aaa';ctx.font=`bold ${sel?24:20}px monospace`;
+      ctx.textAlign='left';ctx.fillText(t.name,205,y+34);
+      ctx.fillStyle=sel?'#fff':'#555';ctx.font='14px monospace';
+      ctx.textAlign='right';ctx.fillText('['+t.abbr+']',640,y+34);
+      if(sel){ctx.fillStyle='#FFD700';ctx.font='bold 22px monospace';ctx.textAlign='left';ctx.fillText('>',110,y+34);}
+    });
+  }
+
+  _dGame(ctx){
+    ctx.fillStyle='#000e20';ctx.fillRect(0,0,W,H);
+    this._dStands(ctx);
+    this._dCrowd(ctx);
+    this._dRink(ctx);
+    this.puItems.forEach(p=>p.draw(ctx));
+    this.players.forEach(p=>this._dPlayer(ctx,p));
+    this._dPuck(ctx);
+    this._dHUD(ctx);
+    // Flash
+    if(this.flash>0){ctx.fillStyle=`rgba(255,215,0,${this.flash*.5})`;ctx.fillRect(0,0,W,H);this.flash-=.016;}
+    // Goal overlay
+    if(this.goalT>0){
+      ctx.fillStyle='rgba(0,0,0,.55)';ctx.fillRect(RX,RY,RW,RH);
+      ctx.fillStyle='#FFD700';ctx.font='bold 60px monospace';ctx.textAlign='center';
+      ctx.fillText('GOAL!',W/2,H/2-20);
+      const tn=this.goalTeam===0?TEAMS[this.sel].name:TEAMS[this.oppTeam].name;
+      ctx.fillStyle='#fff';ctx.font='bold 26px monospace';ctx.fillText(tn,W/2,H/2+30);
+    }
+    // Pause
+    if(this.paused){
+      ctx.fillStyle='rgba(0,0,0,.65)';ctx.fillRect(0,0,W,H);
+      ctx.fillStyle='#FFD700';ctx.font='bold 52px monospace';ctx.textAlign='center';
+      ctx.fillText('PAUSED',W/2,H/2-20);
+      ctx.fillStyle='#aaa';ctx.font='18px monospace';ctx.fillText('Press P to resume',W/2,H/2+35);
+    }
+    // Announce
+    if(this.annT>0){
+      const a=Math.min(1,this.annT);
+      ctx.fillStyle=`rgba(0,0,0,${a*.7})`;ctx.fillRect(W/2-220,H/2-28,440,50);
+      ctx.fillStyle=`rgba(255,220,0,${a})`;ctx.font='bold 22px monospace';ctx.textAlign='center';
+      ctx.fillText(this.ann,W/2,H/2+8);
+    }
+  }
+
+  _dRink(ctx){
+    // Ice surface — rounded shape
+    rinkPath(ctx);ctx.fillStyle='#d8eef8';ctx.fill();
+    // Clip all markings to the rounded ice
+    ctx.save();rinkPath(ctx);ctx.clip();
+    // Blue lines
+    const bl1=RX+RW*.33,bl2=RX+RW*.67;
+    ctx.strokeStyle='rgba(0,50,220,.55)';ctx.lineWidth=5;
+    ctx.beginPath();ctx.moveTo(bl1,RY);ctx.lineTo(bl1,RY+RH);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(bl2,RY);ctx.lineTo(bl2,RY+RH);ctx.stroke();
+    // Red center line
+    ctx.strokeStyle='rgba(210,0,0,.5)';ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(RCX,RY);ctx.lineTo(RCX,RY+RH);ctx.stroke();
+    // Center circle + dot
+    ctx.strokeStyle='rgba(200,0,0,.4)';ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(RCX,RCY,58,0,Math.PI*2);ctx.stroke();
+    ctx.fillStyle='rgba(200,0,0,.55)';ctx.beginPath();ctx.arc(RCX,RCY,5,0,Math.PI*2);ctx.fill();
+    // Faceoff circles
+    [[RX+RW*.2,RY+RH*.3],[RX+RW*.2,RY+RH*.7],[RX+RW*.8,RY+RH*.3],[RX+RW*.8,RY+RH*.7]].forEach(([fx,fy])=>{
+      ctx.strokeStyle='rgba(200,0,0,.4)';ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(fx,fy,38,0,Math.PI*2);ctx.stroke();
+      ctx.fillStyle='rgba(200,0,0,.5)';ctx.beginPath();ctx.arc(fx,fy,4,0,Math.PI*2);ctx.fill();
+    });
+    // Creases (D-shaped)
+    ctx.fillStyle='rgba(80,130,255,.22)';
+    ctx.beginPath();ctx.rect(RX,GOAL_Y,28,GOAL_H);ctx.fill();
+    ctx.beginPath();ctx.arc(RX+28,RCY,GOAL_H*.52,Math.PI/2*3,Math.PI/2);ctx.fill();
+    ctx.beginPath();ctx.rect(RX+RW-28,GOAL_Y,28,GOAL_H);ctx.fill();
+    ctx.beginPath();ctx.arc(RX+RW-28,RCY,GOAL_H*.52,Math.PI/2,Math.PI/2*3);ctx.fill();
+    // Nets (inside ice at boards)
+    [[RX,1],[RX+RW-GOAL_W,-1]].forEach(([gx,dir])=>{
+      ctx.fillStyle='rgba(120,120,120,.7)';ctx.fillRect(gx,GOAL_Y,GOAL_W,GOAL_H);
+      ctx.strokeStyle='#666';ctx.lineWidth=1.5;ctx.strokeRect(gx,GOAL_Y,GOAL_W,GOAL_H);
+      ctx.strokeStyle='rgba(80,80,80,.4)';ctx.lineWidth=1;
+      for(let y=GOAL_Y;y<=GOAL_Y+GOAL_H;y+=9){ctx.beginPath();ctx.moveTo(gx,y);ctx.lineTo(gx+GOAL_W,y);ctx.stroke();}
+      for(let x=gx;x<=gx+GOAL_W;x+=5){ctx.beginPath();ctx.moveTo(x,GOAL_Y);ctx.lineTo(x,GOAL_Y+GOAL_H);ctx.stroke();}
+    });
+    // Goal lines (red line across mouth)
+    ctx.strokeStyle='rgba(220,20,20,.8)';ctx.lineWidth=3;
+    ctx.beginPath();ctx.moveTo(RX+GOAL_W,GOAL_Y);ctx.lineTo(RX+GOAL_W,GOAL_Y+GOAL_H);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(RX+RW-GOAL_W,GOAL_Y);ctx.lineTo(RX+RW-GOAL_W,GOAL_Y+GOAL_H);ctx.stroke();
+    ctx.restore(); // end clip
+    // Goalposts (on top of boards)
+    ctx.strokeStyle='#FF2200';ctx.lineWidth=5;
+    ctx.beginPath();ctx.moveTo(RX,GOAL_Y);ctx.lineTo(RX,GOAL_Y+GOAL_H);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(RX+RW,GOAL_Y);ctx.lineTo(RX+RW,GOAL_Y+GOAL_H);ctx.stroke();
+    // Boards (rounded)
+    rinkPath(ctx);ctx.strokeStyle='#ddeeff';ctx.lineWidth=7;ctx.stroke();
+    // Inner board edge
+    rinkPath(ctx);ctx.strokeStyle='rgba(255,255,255,.4)';ctx.lineWidth=2;ctx.stroke();
+    // Zone labels
+    const lt=TEAMS[this.sel],rt=TEAMS[this.oppTeam];
+    ctx.font='bold 16px monospace';ctx.textAlign='center';
+    const pSideRink=this.left[0]?this.left[0].side:'left';
+    if(pSideRink==='left'){
+      ctx.fillStyle=lt.pri+'99';ctx.fillText(lt.abbr,RX+RW*.16,RY+22);
+      ctx.fillStyle=rt.pri+'99';ctx.fillText(rt.abbr,RX+RW*.84,RY+22);
+    }else{
+      ctx.fillStyle=rt.pri+'99';ctx.fillText(rt.abbr,RX+RW*.16,RY+22);
+      ctx.fillStyle=lt.pri+'99';ctx.fillText(lt.abbr,RX+RW*.84,RY+22);
+    }
+  }
+
+  _dPlayer(ctx,p){
+    const t=TEAMS[p.team];
+    // Penalty box mini-icon
+    if(p.inBox){
+      const bx=p.side==='left'?RX+12:RX+RW-12;
+      ctx.save();ctx.translate(bx,RY-32);ctx.globalAlpha=.75;
+      ctx.fillStyle=t.pri;ctx.beginPath();ctx.arc(0,0,11,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle=t.sec;ctx.lineWidth=2;ctx.stroke();
+      ctx.fillStyle='#fff';ctx.font='bold 8px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(Math.ceil(p.penTimer),0,0);
+      ctx.restore();return;
+    }
+    ctx.save();ctx.translate(p.x,p.y);
+    // Power-up / freeze glow (before rotation)
+    if(p.pu){const pu=PU_TYPES.find(u=>u.type===p.pu);if(pu){ctx.shadowColor=pu.color;ctx.shadowBlur=16;}}
+    if(p.frozen>0){ctx.shadowColor='#88CCFF';ctx.shadowBlur=20;}
+    if(p.stun>0)ctx.globalAlpha=.45+Math.sin(Date.now()/80)*.4;
+    // Controlled-player dashed ring (axis-aligned, before rotation)
+    if(p.controlled){
+      ctx.shadowBlur=0;
+      ctx.strokeStyle='#FFD700';ctx.lineWidth=2.5;ctx.setLineDash([5,4]);
+      ctx.beginPath();ctx.arc(0,0,PR+7,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);
+    }
+    // Rotate sprite so it faces movement direction
+    // Default sprite faces UP (−y), angle=0 means facing right → add 90°
+    ctx.rotate(p.angle+Math.PI/2);
+    if(p.role==='goalie') this._drawGoalie(ctx,t);
+    else this._drawSkater(ctx,t,p.num);
+    ctx.restore();
+    // Freeze snowflake (not rotated)
+    if(p.frozen>0){
+      ctx.save();ctx.translate(p.x,p.y);
+      ctx.fillStyle='#99DDFF';ctx.font='13px sans-serif';ctx.textAlign='center';
+      ctx.fillText('❄',0,-PR-13);ctx.restore();
+    }
+  }
+
+  // ── Pixel-art skater sprite (faces UP in local coords) ──────────────────
+  _drawSkater(ctx,t,num){
+    // Drop shadow
+    ctx.fillStyle='rgba(0,0,0,.22)';
+    ctx.beginPath();ctx.ellipse(2,3,12,8,0,0,Math.PI*2);ctx.fill();
+    // Skate blades
+    ctx.fillStyle='#ccc';
+    ctx.fillRect(-7,10,6,2);   // left blade
+    ctx.fillRect(1,10,6,2);    // right blade
+    // Leg socks
+    ctx.fillStyle=t.sec;
+    ctx.fillRect(-5,3,4,8);    // left leg
+    ctx.fillRect(1,3,4,8);     // right leg
+    // Jersey body
+    ctx.fillStyle=t.pri;
+    ctx.fillRect(-8,-7,16,11);
+    // Jersey accent stripe
+    ctx.fillStyle=t.sec;
+    ctx.fillRect(-8,0,16,3);
+    // Left arm + glove
+    ctx.fillStyle=t.pri;
+    ctx.fillRect(-13,-6,5,8);
+    ctx.fillStyle='#222';
+    ctx.fillRect(-13,1,5,4);
+    // Right arm + glove
+    ctx.fillStyle=t.pri;
+    ctx.fillRect(8,-6,5,8);
+    ctx.fillStyle='#222';
+    ctx.fillRect(8,1,5,4);
+    // Hockey stick shaft + blade
+    ctx.strokeStyle='#7B4A20';ctx.lineWidth=2.5;ctx.lineCap='round';
+    ctx.beginPath();ctx.moveTo(12,3);ctx.lineTo(17,-9);ctx.stroke();
+    ctx.strokeStyle='#4A2800';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(15,-10);ctx.lineTo(22,-7);ctx.stroke();
+    // Helmet
+    ctx.fillStyle=t.pri;
+    ctx.beginPath();ctx.arc(0,-10,6,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle=t.sec;ctx.lineWidth=1.5;ctx.stroke();
+    // Visor
+    ctx.fillStyle='rgba(140,215,255,.55)';
+    ctx.beginPath();ctx.arc(0,-10,5,0.4,Math.PI-0.4);
+    ctx.lineTo(0,-10);ctx.closePath();ctx.fill();
+    // Jersey number (center back)
+    ctx.shadowBlur=0;
+    ctx.fillStyle=t.sec;ctx.font='bold 8px monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(num,0,-2);
+  }
+
+  // ── Goalie sprite — wider pads, cage mask ───────────────────────────────
+  _drawGoalie(ctx,t){
+    // Drop shadow
+    ctx.fillStyle='rgba(0,0,0,.25)';
+    ctx.beginPath();ctx.ellipse(2,4,17,9,0,0,Math.PI*2);ctx.fill();
+    // Leg pads (wide)
+    ctx.fillStyle='#e8e8e8';
+    ctx.fillRect(-20,3,13,7);   // left pad
+    ctx.fillRect(7,3,13,7);     // right pad
+    ctx.fillStyle='#bbb';
+    ctx.fillRect(-20,1,13,3);   // pad top stripe
+    ctx.fillRect(7,1,13,3);
+    // Skates
+    ctx.fillStyle='#999';
+    ctx.fillRect(-18,9,9,2);
+    ctx.fillRect(9,9,9,2);
+    // Body
+    ctx.fillStyle=t.pri;
+    ctx.fillRect(-9,-8,18,12);
+    ctx.strokeStyle=t.sec;ctx.lineWidth=1.5;ctx.strokeRect(-9,-8,18,12);
+    // Chest stripe
+    ctx.fillStyle=t.sec;
+    ctx.fillRect(-9,-2,18,3);
+    // Blocker (right)
+    ctx.fillStyle='#ddd';
+    ctx.fillRect(9,-7,9,9);
+    ctx.strokeStyle='#aaa';ctx.lineWidth=1;ctx.strokeRect(9,-7,9,9);
+    ctx.strokeStyle='#bbb';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(9,-2);ctx.lineTo(18,-2);ctx.stroke();
+    // Catching glove (left)
+    ctx.fillStyle='#666';
+    ctx.fillRect(-18,-7,9,8);
+    ctx.strokeStyle='#444';ctx.lineWidth=1;ctx.strokeRect(-18,-7,9,8);
+    ctx.fillStyle='#444';ctx.fillRect(-18,-7,9,3); // glove cuff
+    // Goalie mask
+    ctx.fillStyle=t.pri;
+    ctx.beginPath();ctx.arc(0,-11,8,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle=t.sec;ctx.lineWidth=2;ctx.stroke();
+    // Cage bars
+    ctx.strokeStyle=t.sec;ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(-6,-11);ctx.lineTo(6,-11);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(0,-18);ctx.lineTo(0,-4);ctx.stroke();
+    ctx.strokeStyle=t.sec+'77';ctx.lineWidth=1;
+    ctx.beginPath();ctx.arc(0,-11,5,0,Math.PI*2);ctx.stroke();
+    // G badge
+    ctx.shadowBlur=0;
+    ctx.fillStyle='#FFD700';ctx.font='bold 8px monospace';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('G',0,-1);
+  }
+
+  _dPuck(ctx){
+    const pk=this.puck,r=pk.r;
+    ctx.save();ctx.translate(pk.x,pk.y);
+    if(pk.big){ctx.shadowColor='#CC44FF';ctx.shadowBlur=12;}
+    // Shadow
+    ctx.fillStyle='rgba(0,0,0,.25)';ctx.beginPath();ctx.ellipse(2,3,r,r*.55,0,0,Math.PI*2);ctx.fill();
+    // Puck
+    ctx.fillStyle=pk.frozen>0?'#77BBFF':'#111';
+    ctx.beginPath();ctx.arc(0,0,r,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.stroke();
+    ctx.restore();
+  }
+
+  _dHUD(ctx){
+    const lt=TEAMS[this.sel],rt=TEAMS[this.oppTeam];
+    // Top bar
+    ctx.fillStyle='#000018';ctx.fillRect(0,0,W,RY-5);
+    // Left score box
+    ctx.fillStyle=lt.pri;ctx.fillRect(18,4,204,RY-12);
+    ctx.strokeStyle=lt.sec;ctx.lineWidth=2;ctx.strokeRect(18,4,204,RY-12);
+    ctx.fillStyle=lt.sec;ctx.font='bold 16px monospace';ctx.textAlign='left';ctx.fillText(lt.name,28,24);
+    ctx.fillStyle='#fff';ctx.font='bold 38px monospace';ctx.textAlign='center';ctx.fillText(this.scores[0],120,68);
+    // Right score box
+    ctx.fillStyle=rt.pri;ctx.fillRect(W-222,4,204,RY-12);
+    ctx.strokeStyle=rt.sec;ctx.lineWidth=2;ctx.strokeRect(W-222,4,204,RY-12);
+    ctx.fillStyle=rt.sec;ctx.font='bold 16px monospace';ctx.textAlign='right';ctx.fillText(rt.name,W-28,24);
+    ctx.fillStyle='#fff';ctx.font='bold 38px monospace';ctx.textAlign='center';ctx.fillText(this.scores[1],W-120,68);
+    // Center clock
+    ctx.fillStyle='#0a0a22';ctx.fillRect(W/2-105,4,210,RY-12);
+    ctx.strokeStyle='#223355';ctx.lineWidth=2;ctx.strokeRect(W/2-105,4,210,RY-12);
+    ctx.fillStyle='#6688BB';ctx.font='bold 13px monospace';ctx.textAlign='center';
+    const pLbl=this.isOT?'OVERTIME':`PERIOD ${this.period}/${NUM_PERIODS}`;
+    ctx.fillText(pLbl,W/2,20);
+    const m=Math.floor(this.clock/60),s=Math.floor(this.clock%60);
+    const tc=`${m}:${s.toString().padStart(2,'0')}`;
+    ctx.fillStyle=this.clock<30&&Math.sin(Date.now()/200)>.0?'#FF4444':'#FFD700';
+    ctx.font='bold 32px monospace';ctx.fillText(tc,W/2,60);
+    // Bottom HUD
+    ctx.fillStyle='#000018';ctx.fillRect(0,RY+RH+5,W,H-RY-RH-5);
+    // Penalties
+    const boxed=this.players.filter(p=>p.inBox);
+    if(boxed.length){
+      ctx.fillStyle='#FF6600';ctx.font='bold 11px monospace';ctx.textAlign='center';
+      let by=RY+RH+18;
+      boxed.forEach(p=>{ctx.fillText(`${TEAMS[p.team].abbr} #${p.num} IN BOX: ${Math.ceil(p.penTimer)}s`,W/2,by);by+=15;});
+    }
+    // Player powerup
+    if(this.p1&&this.p1.pu){
+      const pu=PU_TYPES.find(u=>u.type===this.p1.pu);
+      if(pu){ctx.fillStyle=pu.color;ctx.font='bold 12px monospace';ctx.textAlign='left';
+        ctx.fillText(`POWERUP: ${pu.msg} (${Math.ceil(this.p1.puTimer)}s)`,28,RY+RH+20);}
+    }
+    // Controlled player indicator
+    if(this.p1){
+      ctx.fillStyle='#FFD700';ctx.font='12px monospace';ctx.textAlign='right';
+      ctx.fillText(`CTRL: #${this.p1.num} ${TEAMS[this.p1.team].abbr}`,W-28,RY+RH+20);
+    }
+    // Power-play indicator
+    const lBox=this.left.filter(p=>p.inBox).length;
+    const rBox=this.right.filter(p=>p.inBox).length;
+    if(lBox||rBox){
+      ctx.fillStyle='#FF8800';ctx.font='bold 13px monospace';ctx.textAlign='center';
+      if(rBox>lBox)ctx.fillText('POWER PLAY - '+lt.abbr+'!',W/2,RY+RH+35);
+      else if(lBox>rBox)ctx.fillText('POWER PLAY - '+rt.abbr+'!',W/2,RY+RH+35);
+    }
+  }
+
+  _dChallenge(ctx){
+    if(!this.challenge){this.state='playing';return;}
+    const ch=this.challenge;
+    const cx=W/2,cy=H/2;
+    // Dark overlay
+    ctx.fillStyle='rgba(0,0,0,.85)';ctx.fillRect(0,0,W,H);
+    // Title
+    ctx.fillStyle='#FFD700';ctx.font='bold 44px monospace';ctx.textAlign='center';
+    ctx.fillText('FIGHT CHALLENGE!',cx,cy-148);
+    // Box + fighter cards
+    const t1=TEAMS[ch.p1.team],t2=TEAMS[ch.p2.team];
+    // Left card (challenger)
+    ctx.fillStyle=t1.pri;ctx.fillRect(cx-280,cy-115,200,65);
+    ctx.strokeStyle=t1.sec;ctx.lineWidth=3;ctx.strokeRect(cx-280,cy-115,200,65);
+    ctx.fillStyle=t1.sec;ctx.font='bold 13px monospace';ctx.textAlign='center';
+    ctx.fillText(t1.name,cx-180,cy-95);
+    ctx.fillStyle='#fff';ctx.font='bold 22px monospace';
+    ctx.fillText('#'+ch.p1.num,cx-180,cy-65);
+    ctx.fillStyle='#aaa';ctx.font='11px monospace';
+    ctx.fillText('CHALLENGER',cx-180,cy-55);
+    // VS
+    ctx.fillStyle='#fff';ctx.font='bold 30px monospace';ctx.textAlign='center';
+    ctx.fillText('VS',cx,cy-80);
+    // Right card (challenged)
+    ctx.fillStyle=t2.pri;ctx.fillRect(cx+80,cy-115,200,65);
+    ctx.strokeStyle=t2.sec;ctx.lineWidth=3;ctx.strokeRect(cx+80,cy-115,200,65);
+    ctx.fillStyle=t2.sec;ctx.font='bold 13px monospace';ctx.textAlign='center';
+    ctx.fillText(t2.name,cx+180,cy-95);
+    ctx.fillStyle='#fff';ctx.font='bold 22px monospace';
+    ctx.fillText('#'+ch.p2.num,cx+180,cy-65);
+    ctx.fillStyle='#aaa';ctx.font='11px monospace';
+    ctx.fillText(ch.p2IsHuman?'YOU':'OPPONENT',cx+180,cy-55);
+    // Prompt line
+    ctx.fillStyle='#ddd';ctx.font='bold 17px monospace';ctx.textAlign='center';
+    ctx.fillText(ch.p2IsHuman?'YOU HAVE BEEN CHALLENGED!':'CHALLENGING OPPONENT...',cx,cy-18);
+    // Timer bar
+    const bw=300,bx=cx-bw/2;
+    ctx.fillStyle='#222';ctx.fillRect(bx,cy,bw,14);
+    const frac=Math.max(0,ch.timer/3.0);
+    ctx.fillStyle=frac>.5?'#00CC00':frac>.25?'#FFAA00':'#FF2200';
+    ctx.fillRect(bx,cy,bw*frac,14);
+    ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.strokeRect(bx,cy,bw,14);
+    // Result or instructions
+    if(ch.result!==null){
+      const accepted=ch.result==='fight';
+      ctx.fillStyle=accepted?'#FF4444':'#66FF88';ctx.font='bold 32px monospace';
+      ctx.fillText(accepted?'GLOVES ARE DOWN!':'CHALLENGE DECLINED!',cx,cy+55);
+    }else if(ch.p2IsHuman){
+      ctx.fillStyle='#FFD700';ctx.font='bold 18px monospace';
+      ctx.fillText('F: ACCEPT   SPACE: DECLINE',cx,cy+52);
+    }else{
+      ctx.fillStyle='#888';ctx.font='16px monospace';
+      ctx.fillText('WAITING FOR RESPONSE...',cx,cy+52);
+    }
+  }
+
+  _dPeriodEnd(ctx){
+    ctx.fillStyle='rgba(0,0,0,.82)';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#FFD700';ctx.font='bold 42px monospace';ctx.textAlign='center';
+    const tied=this.period>=NUM_PERIODS&&this.scores[0]===this.scores[1];
+    ctx.fillText(tied?'TIE GAME!':`END OF PERIOD ${this.period}`,W/2,H/2-70);
+    if(tied){ctx.fillStyle='#FF8800';ctx.font='bold 22px monospace';ctx.fillText('OVERTIME — 3 ON 3!',W/2,H/2-30);}
+    const lt=TEAMS[this.sel],rt=TEAMS[this.oppTeam];
+    ctx.fillStyle='#fff';ctx.font='bold 28px monospace';
+    ctx.fillText(`${lt.name}: ${this.scores[0]}`,W/2,tied?H/2+10:H/2-10);
+    ctx.fillText(`${rt.name}: ${this.scores[1]}`,W/2,tied?H/2+55:H/2+35);
+    const prompt=tied?'PRESS SPACE FOR OVERTIME':'PRESS SPACE TO CONTINUE';
+    if(Math.sin(Date.now()/500)>.0){
+      ctx.fillStyle='#aaa';ctx.font='18px monospace';
+      ctx.fillText(prompt,W/2,H/2+110);
+    }
+  }
+
+  _dGameOver(ctx){
+    ctx.fillStyle='rgba(0,0,20,.9)';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#FFD700';ctx.font='bold 52px monospace';ctx.textAlign='center';
+    ctx.fillText('GAME OVER',W/2,H/2-110);
+    const lt=TEAMS[this.sel],rt=TEAMS[this.oppTeam];
+    ctx.fillStyle='#fff';ctx.font='bold 26px monospace';
+    ctx.fillText(`${lt.name}: ${this.scores[0]}`,W/2,H/2-40);
+    ctx.fillText(`${rt.name}: ${this.scores[1]}`,W/2,H/2+5);
+    const w=this.scores[0]>this.scores[1]?lt.name:this.scores[1]>this.scores[0]?rt.name:null;
+    ctx.fillStyle='#FFD700';ctx.font='bold 34px monospace';
+    ctx.fillText(w?`${w} WINS!`:"IT'S A TIE!",W/2,H/2+60);
+    if(Math.sin(Date.now()/500)>.0){
+      ctx.fillStyle='#888';ctx.font='18px monospace';
+      ctx.fillText('PRESS SPACE TO PLAY AGAIN',W/2,H/2+120);
+    }
+  }
+
+  // ─── Side-switch & OT/Shootout ───────────────
+  _swapSides(){
+    for(const p of this.players){
+      p.side=p.side==='left'?'right':'left';
+      p.hx=RX+RW-(p.hx-RX);
+      p.angle=p.side==='left'?0:Math.PI;
+    }
+  }
+
+  _startOT(){
+    this.isOT=true;
+    this.period=NUM_PERIODS+1;
+    this.clock=300;
+    // 3v3: bench LW (idx 0) and RW (idx 2) from both teams
+    [this.left[0],this.left[2],this.right[0],this.right[2]].forEach(p=>{
+      p.penTimer=9999;p.inBox=true;p.vx=0;p.vy=0;
+      if(this.puck&&this.puck.owner===p)this.puck.owner=null;
+    });
+    this._swapSides();
+    this._faceoff();this._setControlled();
+    this.state='playing';
+    this.announce('OVERTIME! 3 ON 3!',3);
+  }
+
+  _startShootout(){
+    this.state='shootout';
+    // Release any OT-benched players (penTimer===9999)
+    this.players.forEach(p=>{if(p.penTimer===9999){p.penTimer=0;p.inBox=false;}});
+    this.so={
+      round:1,maxRounds:3,shots:[[],[]],turn:0,
+      phase:'setup',timer:0,resultTimer:0,
+      shooterIdx:0,goalScored:false,sudden:false,
+    };
+    this.announce('SHOOTOUT!',2);
+  }
+
+  _nextShooter(){
+    const so=this.so;
+    // Bench everyone
+    this.players.forEach(p=>{
+      p.inBox=true;p.penTimer=9999;p.vx=0;p.vy=0;
+      if(this.puck&&this.puck.owner===p)this.puck.owner=null;
+    });
+    const isP=so.turn===0;
+    const sArr=isP?this.left:this.right;
+    const gArr=isP?this.right:this.left;
+    const fwds=sArr.filter(p=>p.role==='forward');
+    const shooter=fwds[so.shooterIdx%fwds.length];
+    const goalie=gArr.find(p=>p.role==='goalie');
+    shooter.inBox=false;shooter.penTimer=0;
+    goalie.inBox=false;goalie.penTimer=0;
+    // Hardcode: turn 0 always shoots right (RX+RW), turn 1 shoots left (RX)
+    if(isP){
+      shooter.x=RCX-80;shooter.y=RCY;shooter.angle=0;shooter.side='left';
+      goalie.x=RX+RW-24;goalie.y=RCY;goalie.angle=Math.PI;goalie.side='right';
+    }else{
+      shooter.x=RCX+80;shooter.y=RCY;shooter.angle=Math.PI;shooter.side='right';
+      goalie.x=RX+24;goalie.y=RCY;goalie.angle=0;goalie.side='left';
+    }
+    shooter.vx=0;shooter.vy=0;goalie.vx=0;goalie.vy=0;
+    shooter.stun=0;shooter.frozen=0;goalie.stun=0;goalie.frozen=0;
+    this.puck.reset();this.puck.owner=shooter;this.puck.big=false;this.puck.frozen=0;
+    goalie.isAI=true;
+    if(isP){this._ctrl(shooter);}
+    else{shooter.isAI=true;this.p1=null;this.players.forEach(pl=>pl.controlled=false);}
+    so.phase='shooting';so.timer=6.0;so.goalScored=false;
+    this.challengeCD=9;this.goaliePuckTimer=0;
+    this.annT=0;
+  }
+
+  _advanceShootout(){
+    const so=this.so;
+    this.players.forEach(p=>{p.inBox=true;p.penTimer=9999;});
+    if(so.turn===0){
+      so.turn=1;
+    }else{
+      so.turn=0;
+      const g0=so.shots[0].filter(Boolean).length;
+      const g1=so.shots[1].filter(Boolean).length;
+      const rem0=so.maxRounds-so.shots[0].length;
+      const rem1=so.maxRounds-so.shots[1].length;
+      if(!so.sudden){
+        if(g0>g1+rem1){this._endShootout(0);return;}
+        if(g1>g0+rem0){this._endShootout(1);return;}
+        if(so.shots[0].length>=so.maxRounds&&so.shots[1].length>=so.maxRounds){
+          if(g0!==g1){this._endShootout(g0>g1?0:1);return;}
+          so.sudden=true;
+        }
+      }else{
+        const sd0=so.shots[0].length-so.maxRounds;
+        const sd1=so.shots[1].length-so.maxRounds;
+        if(sd0>0&&sd0===sd1){
+          const sg0=so.shots[0].slice(so.maxRounds).filter(Boolean).length;
+          const sg1=so.shots[1].slice(so.maxRounds).filter(Boolean).length;
+          if(sg0!==sg1){this._endShootout(sg0>sg1?0:1);return;}
+        }
+      }
+      so.round++;
+    }
+    so.shooterIdx++;
+    this._nextShooter();
+  }
+
+  _endShootout(winner){
+    this.scores[winner]++;
+    this.state='gameover';
+  }
+
+  _uShootout(dt){
+    const so=this.so;
+    if(!so){this.state='gameover';return;}
+    if(this.annT>0)this.annT-=dt;
+    if(this.flash>0)this.flash-=dt;
+    if(so.phase==='setup'){
+      if(Keys.pressed('Space')||Keys.pressed('Enter')||Keys.pressed('KeyZ'))this._nextShooter();
+      return;
+    }
+    if(so.phase==='result'){
+      so.resultTimer-=dt;
+      if(so.resultTimer<=0)this._advanceShootout();
+      return;
+    }
+    // phase === 'shooting'
+    so.timer-=dt;
+    this._p1Input(dt);
+    this.players.forEach(p=>{if(!p.inBox)p.update(dt,this.puck,this.players);});
+    this.puck.update(dt);
+    // Puck pickup
+    if(!this.puck.owner){
+      for(const p of this.players){
+        if(p.inBox)continue;
+        if(dist(p,this.puck)<PR+this.puck.r+2){this.puck.owner=p;SFX.puck();break;}
+      }
+    }
+    // Goal check
+    if(!so.goalScored){
+      const pk=this.puck,r=pk.r;
+      const isP=so.turn===0;
+      const scored=(isP&&pk.x+r>RX+RW&&pk.y>GOAL_Y&&pk.y<GOAL_Y+GOAL_H)||
+                   (!isP&&pk.x-r<RX&&pk.y>GOAL_Y&&pk.y<GOAL_Y+GOAL_H);
+      if(scored){
+        so.goalScored=true;so.shots[so.turn].push(true);
+        so.phase='result';so.resultTimer=2.5;
+        SFX.goal();this.flash=0.6;
+        this.announce('GOAL!',2.5);
+        return;
+      }
+    }
+    // Goalie save check
+    const goalie=this.players.find(p=>!p.inBox&&p.role==='goalie');
+    if(goalie&&this.puck.owner===goalie&&!so.goalScored){
+      so.shots[so.turn].push(false);
+      so.phase='result';so.resultTimer=2.0;
+      this.announce('SAVE!',2.0);
+      return;
+    }
+    // Timer expired or puck bounced back past center
+    const pk=this.puck;
+    const isP=so.turn===0;
+    const puckWentBack=!pk.owner&&(isP?pk.x<RCX-100:pk.x>RCX+100);
+    if((so.timer<=0||puckWentBack)&&!so.goalScored){
+      so.shots[so.turn].push(false);
+      so.phase='result';so.resultTimer=2.0;
+      this.announce('MISS!',2.0);
+    }
+  }
+
+  _dShootoutOverlay(ctx){
+    const so=this.so;
+    if(!so)return;
+    if(so.phase==='setup'){
+      ctx.fillStyle='rgba(0,0,10,.78)';ctx.fillRect(0,H/2-55,W,110);
+      ctx.fillStyle='#FFD700';ctx.font='bold 36px monospace';ctx.textAlign='center';
+      ctx.fillText('SHOOTOUT!',W/2,H/2-10);
+      if(Math.sin(Date.now()/300)>.0){
+        ctx.fillStyle='#fff';ctx.font='bold 18px monospace';
+        ctx.fillText('PRESS SPACE TO BEGIN',W/2,H/2+30);
+      }
+      return;
+    }
+    // Top info bar
+    ctx.fillStyle='rgba(0,0,10,.85)';ctx.fillRect(0,0,W,46);
+    const lt=TEAMS[this.sel],rt=TEAMS[this.oppTeam];
+    const g0=so.shots[0].filter(Boolean).length;
+    const g1=so.shots[1].filter(Boolean).length;
+    const rlbl=so.sudden?'SUDDEN DEATH':'ROUND '+so.round;
+    ctx.fillStyle='#FFD700';ctx.font='bold 14px monospace';ctx.textAlign='center';
+    ctx.fillText(`SHOOTOUT — ${rlbl}   ${lt.abbr} ${g0} : ${g1} ${rt.abbr}`,W/2,15);
+    // Shot result dots
+    const dotY=35;
+    for(let i=0;i<so.shots[0].length;i++){
+      ctx.fillStyle=so.shots[0][i]?'#00EE00':'#EE2200';
+      ctx.beginPath();ctx.arc(W/2-130+i*18,dotY,5,0,Math.PI*2);ctx.fill();
+    }
+    for(let i=0;i<so.shots[1].length;i++){
+      ctx.fillStyle=so.shots[1][i]?'#00EE00':'#EE2200';
+      ctx.beginPath();ctx.arc(W/2+130-i*18,dotY,5,0,Math.PI*2);ctx.fill();
+    }
+    // Bottom timer + instructions
+    if(so.phase==='shooting'){
+      ctx.fillStyle='rgba(0,0,10,.8)';ctx.fillRect(0,H-52,W,52);
+      const bw=260,bx=W/2-130;
+      ctx.fillStyle='#333';ctx.fillRect(bx,H-20,bw,8);
+      const frac=Math.max(0,so.timer/6);
+      ctx.fillStyle=frac>.5?'#44DD44':frac>.25?'#FFAA00':'#FF2200';
+      ctx.fillRect(bx,H-20,bw*frac,8);
+      ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.strokeRect(bx,H-20,bw,8);
+      ctx.fillStyle=so.turn===0?'#fff':'#888';ctx.font='12px monospace';ctx.textAlign='center';
+      ctx.fillText(so.turn===0?'SPACE:SHOOT  ARROWS/WASD:MOVE':'OPPONENT SHOOTING...',W/2,H-28);
+    }
+    // Announce
+    if(this.annT>0){
+      const a=Math.min(1,this.annT);
+      ctx.fillStyle=`rgba(0,0,0,${a*.7})`;ctx.fillRect(W/2-180,H/2-28,360,50);
+      ctx.fillStyle=`rgba(255,220,0,${a})`;ctx.font='bold 26px monospace';ctx.textAlign='center';
+      ctx.fillText(this.ann,W/2,H/2+8);
+    }
+  }
+
+  run(){
+    let last=0;
+    const loop=ts=>{
+      const dt=Math.min((ts-last)/1000,.05);last=ts;
+      try{this.update(dt);this.draw();}
+      catch(e){
+        console.error('Game loop error:',e);
+        // Reset to safe state so the loop keeps running
+        this.state='playing';this.fight=null;this.challenge=null;
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+}
+
+// ─────────────────────────────────────────────
+// BOOT
+// ─────────────────────────────────────────────
+const game=new Game(document.getElementById('game'));
+game.run();
+</script>
+</body>
+</html>
